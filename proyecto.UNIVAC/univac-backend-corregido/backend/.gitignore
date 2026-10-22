@@ -1,0 +1,32 @@
+# --- Variables de entorno (NO SUBIR) ---------------------------------------
+.env
+.env.*
+!.env.example
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env-template
+.env-plantilla
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+node_modules/
+
+# --- Build / tooling -------------------------------------------------------
+build/
+dist/
+.next/
+.vercel/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Logs ------------------------------------------------------------------
+*.log
+logs
