@@ -122,4 +122,10 @@ def get_current_user(
     if usuario.bloqueado:
         _rechazar("Usuario deshabilitado")
 
+    if usuario.nivel_clave != 2:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Usuario no autorizado para consultar esta estadística"
+        )
+
     return usuario

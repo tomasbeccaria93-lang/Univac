@@ -156,7 +156,8 @@ def login(
         joinedload(Usuario.empresa)
     ).filter(
         Usuario.identificacion == datos.usuario,
-        Usuario.documento == datos.documento
+        Usuario.documento == datos.documento,
+        Usuario.nivel_clave == 2
     ).all()
 
     if not usuarios:

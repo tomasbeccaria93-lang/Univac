@@ -40,6 +40,16 @@ api.interceptors.response.use(
         window.location.href = '/'
       }
     }
+    const noAutorizado =
+      err.response &&
+      err.response.status === 403 &&
+      String(err.response.data?.detail || '').toLowerCase().includes('no autorizado')
+    if (noAutorizado) {
+      limpiarSesion()
+      if (window.location.pathname !== '/') {
+        window.location.href = '/'
+      }
+    }
     return Promise.reject(err)
   }
 )

@@ -42,6 +42,10 @@ const estaLogueado = () => {
     limpiarSesion()
     return false
   }
+  if (localStorage.getItem('nivel_clave') !== '2') {
+    limpiarSesion()
+    return false
+  }
   return true
 }
 
