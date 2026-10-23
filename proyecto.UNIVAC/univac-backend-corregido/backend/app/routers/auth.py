@@ -156,8 +156,7 @@ def login(
         joinedload(Usuario.empresa)
     ).filter(
         Usuario.identificacion == datos.usuario,
-        Usuario.documento == datos.documento,
-        Usuario.nivel_clave == 2
+        Usuario.documento == datos.documento
     ).all()
 
     if not usuarios:
@@ -184,7 +183,15 @@ def login(
             detail="Usuario o contraseña incorrectos"
         )
 
-    candidatos = [u for u in validos if u.empresa is not None]
+    autorizados = [u for u in validos if _to_int(u.nivel_clave) == 2]
+
+    if not autorizados:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Usuario no autorizado"
+        )
+
+    candidatos = [u for u in autorizados if u.empresa is not None]
 
     if not candidatos:
         raise HTTPException(
