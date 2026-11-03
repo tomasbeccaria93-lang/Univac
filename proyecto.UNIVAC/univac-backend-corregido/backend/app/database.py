@@ -8,6 +8,16 @@ logger = logging.getLogger("univac.database")
 
 DATABASE_URL = settings.connection_string()
 
+connect_args = {"connect_timeout": 10}
+
+ssl_ca = settings.ssl_ca_path()
+if ssl_ca:
+    connect_args["ssl"] = {
+        "ca": ssl_ca,
+        "check_hostname": True,
+    }
+    logger.info("SSL habilitado para MySQL (CA: %s)", ssl_ca)
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -15,7 +25,7 @@ engine = create_engine(
     pool_size=15,
     max_overflow=10,
     echo=False,
-    connect_args={"connect_timeout": 10}
+    connect_args=connect_args
 )
 
 

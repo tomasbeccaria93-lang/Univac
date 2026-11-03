@@ -26,6 +26,9 @@ cp .env-plantilla .env   # Windows: Copy-Item .env-plantilla .env
 
 Variables principales:
 - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` — conexión MySQL.
+- `DB_SSL_ENABLED` / `DB_SSL_CA` — habilitan TLS y apuntan al certificado CA
+  (por ejemplo `certs/azure-mysql-ca-bundle.pem`). Obligatorio para Azure
+  Database for MySQL.
 - `SECRET_KEY` — clave de firma de los JWT. **Obligatoria y secreta.** Genérela
   con `python -c "import secrets; print(secrets.token_hex(32))"`. Si no se define,
   el backend la genera aleatoriamente en cada reinicio e invalida todos los tokens.
