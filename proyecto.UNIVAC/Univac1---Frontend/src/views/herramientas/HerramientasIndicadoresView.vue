@@ -63,12 +63,14 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import api from '../../api'
 import ChartCard from '../../components/ui/ChartCard.vue'
 import BaseChart from '../../components/charts/BaseChart.vue'
 import { colorVentas, colorCompras } from '../../utils/chartTokens'
+import { useEstadoDatos } from '../../composables/useEstadoDatos'
 
+const { estado } = useEstadoDatos()
 const indicadores = ref({})
 const cargando = ref(false)
 const error = ref('')
@@ -87,7 +89,9 @@ const cargar = async () => {
   cargando.value = true
   error.value = ''
   try {
-    const { data } = await api.get('/reportes/herramientas/indicadores')
+    const { data } = await api.get('/reportes/herramientas/indicadores', {
+      params: { estado: estado.value }
+    })
     indicadores.value = data
   } catch (e) {
     error.value = e.response?.data?.detail || 'No se pudieron cargar los datos.'
@@ -96,5 +100,6 @@ const cargar = async () => {
   }
 }
 
+watch(estado, cargar)
 onMounted(cargar)
 </script>

@@ -40,6 +40,9 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+security_store.sqlite3
+security_store.sqlite3-*
+*.sqlite3
 
 # --- Logs ------------------------------------------------------------------
 logs

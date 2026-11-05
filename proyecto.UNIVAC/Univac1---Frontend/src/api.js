@@ -1,5 +1,5 @@
 import axios from 'axios'
-import { limpiarSesion } from './utils/sesion'
+import { limpiarSesion, obtenerCsrf } from './utils/sesion'
 
 // La URL del backend se inyecta en tiempo de build desde la variable de
 // entorno VITE_API_URL. Si viene vacia se usan rutas relativas al origen.
@@ -15,15 +15,21 @@ if (!API_URL) {
 const api = axios.create({
   baseURL: API_URL,
   timeout: 30000,
+  withCredentials: true,
   headers: {
     'Content-Type': 'application/json'
   }
 })
 
+const METODOS_SEGUROS = new Set(['get', 'head', 'options'])
+
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('token')
-  if (token) {
-    config.headers.Authorization = 'Bearer ' + token
+  const metodo = String(config.method || 'get').toLowerCase()
+  if (!METODOS_SEGUROS.has(metodo)) {
+    const csrf = obtenerCsrf()
+    if (csrf) {
+      config.headers['X-CSRF-Token'] = csrf
+    }
   }
   return config
 })
@@ -40,11 +46,12 @@ api.interceptors.response.use(
         window.location.href = '/'
       }
     }
-    const noAutorizado =
+    const detalle = String(err.response?.data?.detail || '').toLowerCase()
+    const sesionInvalida =
       err.response &&
       err.response.status === 403 &&
-      String(err.response.data?.detail || '').toLowerCase().includes('no autorizado')
-    if (noAutorizado) {
+      (detalle.includes('no autorizado') || detalle.includes('csrf'))
+    if (sesionInvalida) {
       limpiarSesion()
       if (window.location.pathname !== '/') {
         window.location.href = '/'

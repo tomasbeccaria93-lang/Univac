@@ -83,13 +83,15 @@
 </template>
 
 <script setup>
-import { ref, shallowRef, computed, onMounted } from 'vue'
+import { ref, shallowRef, computed, onMounted, watch } from 'vue'
 import api from '../../api'
 import { exportToExcel } from '../../utils/exportToExcel'
 import ChartCard from '../../components/ui/ChartCard.vue'
 import BaseChart from '../../components/charts/BaseChart.vue'
 import { colorVentas, colorCompras } from '../../utils/chartTokens'
+import { useEstadoDatos } from '../../composables/useEstadoDatos'
 
+const { estado } = useEstadoDatos()
 const anio = ref(null)
 const mes = ref(null)
 const datos = shallowRef([])
@@ -122,7 +124,7 @@ const buscar = async () => {
   datos.value = []
   try {
     const { data } = await api.get('/reportes/compras/iva', {
-      params: { anio: anio.value || undefined, mes: mes.value || undefined }
+      params: { anio: anio.value || undefined, mes: mes.value || undefined, estado: estado.value }
     })
     datos.value = Array.isArray(data) ? data : (data.detalle || [])
     debitoFiscal.value = data.debito_fiscal || 0
@@ -144,5 +146,6 @@ const exportar = () => {
   ], 'Posicion_Mensual_IVA')
 }
 
+watch(estado, buscar)
 onMounted(buscar)
 </script>

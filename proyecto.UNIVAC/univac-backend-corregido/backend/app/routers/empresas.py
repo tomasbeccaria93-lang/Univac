@@ -11,6 +11,13 @@ router = APIRouter(
 )
 
 
+def _visualiza_totales(usuario):
+    valor = getattr(usuario, "visualiza_totales", False)
+    if isinstance(valor, bool):
+        return valor
+    return str(valor).strip().upper() in ("S", "T", "1", "TRUE", "VERDADERO", "X")
+
+
 @router.get("/perfil", response_model=schemas.EmpresaResponse)
 def perfil_empresa(
     usuario=Depends(get_current_user),
@@ -26,4 +33,12 @@ def perfil_empresa(
             detail="Empresa inexistente"
         )
 
-    return empresa
+    respuesta = schemas.EmpresaResponse.model_validate(empresa)
+    if not _visualiza_totales(usuario):
+        respuesta.razon_social = None
+        respuesta.cuit = None
+        respuesta.direccion = None
+        respuesta.telefono = None
+        respuesta.email = None
+        respuesta.mensaje = None
+    return respuesta

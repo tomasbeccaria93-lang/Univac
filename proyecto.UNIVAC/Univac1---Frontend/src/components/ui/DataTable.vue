@@ -155,7 +155,7 @@ const filasFiltradas = computed(() => {
 })
 
 const paginaEfectiva = computed(() =>
-  props.filas.length > props.umbralPaginado ? props.porPagina : props.filas.length || 1
+  filasFiltradas.value.length > props.umbralPaginado ? props.porPagina : filasFiltradas.value.length || 1
 )
 
 const paginas = computed(() => Math.max(1, Math.ceil(filasFiltradas.value.length / paginaEfectiva.value)))

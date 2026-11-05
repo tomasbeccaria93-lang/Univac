@@ -1,5 +1,11 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { limpiarSesion } from '../utils/sesion'
+import api from '../api'
+import {
+  estaLogueado,
+  guardarCsrf,
+  limpiarSesion,
+  obtenerCsrf
+} from '../utils/sesion'
 
 const LoginView = () => import('../views/LoginView.vue')
 const DashboardView = () => import('../views/DashboardView.vue')
@@ -33,21 +39,6 @@ const Vendedores = () => import('../views/ventas/VentasVendedorArticulosView.vue
 const VendedoresRubros = () => import('../views/ventas/VentasVendedorRubrosView.vue')
 
 const ResultadoVentas = () => import('../views/resultados/ResultadoVentasView.vue')
-
-const estaLogueado = () => {
-  const token = localStorage.getItem('token')
-  const expiry = localStorage.getItem('token_expiry')
-  if (!token) return false
-  if (expiry && Date.now() > parseInt(expiry)) {
-    limpiarSesion()
-    return false
-  }
-  if (localStorage.getItem('nivel_clave') !== '2') {
-    limpiarSesion()
-    return false
-  }
-  return true
-}
 
 const router = createRouter({
   history: createWebHistory(),
@@ -176,12 +167,34 @@ const router = createRouter({
   ]
 })
 
-router.beforeEach((to, from, next) => {
-  if (!estaLogueado() && to.path !== '/') {
-    next('/')
-  } else {
-    next()
+router.beforeEach(async (to, from, next) => {
+  if (to.path === '/') {
+    if (estaLogueado()) {
+      next('/dashboard')
+    } else {
+      next()
+    }
+    return
   }
+
+  if (!estaLogueado()) {
+    limpiarSesion()
+    next('/')
+    return
+  }
+
+  if (!obtenerCsrf()) {
+    try {
+      const { data } = await api.get('/auth/me')
+      guardarCsrf(data.csrf_token)
+    } catch {
+      limpiarSesion()
+      next('/')
+      return
+    }
+  }
+
+  next()
 })
 
 export default router

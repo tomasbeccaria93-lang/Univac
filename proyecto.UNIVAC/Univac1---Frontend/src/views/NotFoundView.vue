@@ -13,11 +13,12 @@
 
 <script setup>
 import { useRouter } from 'vue-router'
+import { estaLogueado } from '../utils/sesion'
 
 const router = useRouter()
 
 function irInicio() {
-  if (localStorage.getItem('token')) {
+  if (estaLogueado()) {
     router.push('/dashboard')
   } else {
     router.push('/')

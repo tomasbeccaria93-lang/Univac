@@ -2,7 +2,6 @@
   <div class="login-page">
     <div class="left-panel">
       <div class="brand" :class="{ visible: brandVisible }">
-        <div class="kicker">Cluster Tecnológico San Francisco</div>
         <div class="logo-frame">
           <div class="logo-ring"></div>
           <img src="../assets/logo-univac.png" alt="UNIVAC" class="logo" />
@@ -16,7 +15,7 @@
     </div>
 
     <div class="right-panel">
-      <a href="https://clustersanfrancisco.com.ar/" target="_blank" rel="noopener noreferrer" class="link-info">
+      <a href="https://www.univac.com.ar/" target="_blank" rel="noopener noreferrer" class="link-info">
         Acerca de UNIVAC
       </a>
 
@@ -93,10 +92,15 @@
           </transition>
         </div>
       </transition>
+
+      <div class="proa-credit" title="Proyecto con Escuela PROA">
+        <img src="../assets/logo-proa.png" alt="Escuela PROA" class="proa-logo" />
+        <span>Escuela PROA</span>
+      </div>
     </div>
 
     <footer class="footer-login">
-      <p>2026 Cluster Tecnológico San Francisco. Todos los derechos reservados.</p>
+      <p>© 2026 UNIVAC. Todos los derechos reservados.</p>
       <span>San Francisco, Córdoba, Argentina</span>
     </footer>
   </div>
@@ -106,6 +110,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '../api'
+import { guardarCsrf } from '../utils/sesion'
 
 const router = useRouter()
 const documento = ref('')
@@ -124,6 +129,7 @@ const cardVisible = ref(false)
 const mostrandoEmpresas = ref(false)
 const empresas = ref([])
 const empresaSeleccionando = ref(null)
+const selectionToken = ref('')
 
 const empresasActivas = computed(() => empresas.value.filter((e) => e.activa))
 
@@ -143,7 +149,7 @@ const login = async () => {
     const { data } = await api.post('/auth/login', {
       usuario: usuario.value.trim(),
       documento: documento.value.trim(),
-      password: clave.value.trim()
+      password: clave.value
     })
 
     if (data.require_selection) {
@@ -156,6 +162,7 @@ const login = async () => {
         return
       }
       empresas.value = empresasDisp
+      selectionToken.value = data.selection_token || ''
       cargando.value = false
       if (activas.length === 1) {
         seleccionarEmpresa(activas[0])
@@ -188,7 +195,8 @@ const seleccionarEmpresa = async (emp) => {
   try {
     const { data } = await api.post('/auth/seleccionar-empresa', {
       usuario_id: emp.usuario_id,
-      empresa_id: emp.id
+      empresa_id: emp.id,
+      selection_token: selectionToken.value
     })
     guardarSesion(data)
     mensaje.value = `Accediendo a ${emp.nombre}...`
@@ -203,8 +211,8 @@ const seleccionarEmpresa = async (emp) => {
 
 const guardarSesion = (data) => {
   try {
-    localStorage.setItem('token', data.access_token)
-    localStorage.setItem('token_expiry', Date.now() + 120 * 60 * 1000)
+    guardarCsrf(data.csrf_token)
+    localStorage.setItem('sesion_activa', '1')
     localStorage.setItem('usuario_id', data.usuario_id)
     localStorage.setItem('empresa_id', data.empresa_id)
     localStorage.setItem('ultima_empresa', data.empresa_id)
@@ -227,6 +235,7 @@ const volverAlLogin = () => {
   mostrandoEmpresas.value = false
   empresas.value = []
   empresaSeleccionando.value = null
+  selectionToken.value = ''
   mensaje.value = ''
 }
 </script>
@@ -378,6 +387,29 @@ const volverAlLogin = () => {
 @keyframes panelCambiar {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+.proa-credit {
+  position: absolute;
+  right: 22px;
+  bottom: 72px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  opacity: 0.78;
+  pointer-events: none;
+  z-index: 6;
+}
+
+.proa-logo {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  display: block;
 }
 
 .card-head {
@@ -634,6 +666,7 @@ const volverAlLogin = () => {
   .brand h1 { font-size: 34px; }
   .card-head h3 { font-size: 20px; }
   .footer-login { position: relative; }
+  .proa-credit { bottom: 18px; }
 }
 
 @media (max-width: 600px) {
@@ -648,6 +681,8 @@ const volverAlLogin = () => {
   .right-panel { padding: 28px 20px; padding-bottom: 80px; }
   .link-info { top: 16px; right: 16px; font-size: 11px; }
   .login-block { max-width: 100%; }
+  .proa-credit { right: 16px; bottom: 14px; gap: 6px; font-size: 10px; }
+  .proa-logo { width: 24px; height: 24px; }
   .card-head { margin-bottom: 24px; }
   .card-head h3 { font-size: 19px; }
   .card-head p { font-size: 12px; }

@@ -1,12 +1,17 @@
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
+import json
 import time
 import threading
 
+from .. import security_store
+from ..config import settings
 from ..database import get_db, SessionLocal
 from ..auth import get_current_user
 from ..models import Usuario
@@ -15,6 +20,168 @@ REPORT_TTL = 600
 _report_cache = {}
 _REPORT_MAX = 300
 _report_lock = threading.Lock()
+_REPORT_SEMAFORO = threading.BoundedSemaphore(settings.REPORT_MAX_CONCURRENT)
+
+# Los nombres de tabla/columna salen siempre de este mapa cerrado; nada que
+# venga del cliente se concatena al SQL.
+_TABLAS = {
+    "comprobantes_compras": ("comprobantes_compras", "_comprobantes_compras"),
+    "comprobantes_ventas": ("comprobantes_ventas", "_comprobantes_ventas"),
+    "ingresos_egresos": ("ingresos_egresos", "_ingresos_egresos"),
+    "esporadicos": ("esporadicos", "_esporadicos"),
+    "comprobantes_cuerpo": ("comprobantes_cuerpo", "_comprobantes_cuerpo"),
+}
+_COLUMNAS = {
+    "precio_ultima_compra": (
+        "a.precio_ultima_compra",
+        "a.precio_ultima_compra_",
+    ),
+}
+
+_CLAVES_NO_MONETARIAS = {
+    "cantidad", "cantidad_registros", "total_registros", "total_filas",
+    "total_paginas", "page", "limit", "offset", "nivel_clave", "rol",
+    "id", "ids", "id_empresa", "empresa_id", "usuario_id", "id_sucursal",
+    "id_comprobante", "comprobantes", "documento", "identificacion",
+    "ordenamiento_articulos", "dia_cumpleanos", "mes_cumpleanos",
+}
+
+_CLAVES_MONETARIAS = (
+    "total", "subtotal", "importe", "monto", "saldo", "debe", "haber",
+    "precio", "costo", "ganancia", "resultado", "iva", "alicuota", "neto",
+    "descuento", "percepcion", "retencion", "cobranza", "pago", "egreso",
+    "ingreso", "venta", "compra", "facturacion", "cheque", "deposito",
+    "acumulad", "promedio", "margen", "rentabilidad", "valor", "cuit",
+    "clave_fiscal", "cbu", "smtp",
+)
+
+
+def _validar_estado(estado):
+    if estado not in (0, 1):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El parámetro estado debe ser 0 o 1."
+        )
+    return estado
+
+
+def _estado_param(estado: int = Query(0, description="0=actual, 1=respaldo")):
+    return _validar_estado(estado)
+
+
+def _tabla(base, estado):
+    _validar_estado(estado)
+    try:
+        return _TABLAS[base][estado]
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tabla de reporte no permitida."
+        )
+
+
+def _columna(base, estado):
+    _validar_estado(estado)
+    try:
+        return _COLUMNAS[base][estado]
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Columna de reporte no permitida."
+        )
+
+
+def _clave_monetaria(key):
+    k = str(key).lower()
+    if k in _CLAVES_NO_MONETARIAS:
+        return False
+    if k.startswith(("id_", "nro_", "numero_")):
+        return False
+    if any(x in k for x in ("registro", "fila", "pagina", "cantidad", "comprobantes")):
+        return False
+    return any(x in k for x in _CLAVES_MONETARIAS)
+
+
+def _ocultar_totales(valor):
+    if isinstance(valor, dict):
+        return {
+            k: (None if _clave_monetaria(k) else _ocultar_totales(v))
+            for k, v in valor.items()
+        }
+    if isinstance(valor, list):
+        return [_ocultar_totales(v) for v in valor]
+    return valor
+
+
+def _visualiza_totales(usuario):
+    valor = getattr(usuario, "visualiza_totales", False)
+    if isinstance(valor, bool):
+        return valor
+    return str(valor).strip().upper() in ("S", "T", "1", "TRUE", "VERDADERO", "X")
+
+
+def _limite_reportes(
+    request: Request,
+    usuario: Usuario = Depends(get_current_user),
+):
+    ip = request.client.host if request.client else "desconocida"
+    if not security_store.permitir(
+        f"report-user:{usuario.id}",
+        settings.REPORT_RATE_LIMIT_PER_MINUTE,
+        60,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Demasiadas consultas de reportes. Espere un minuto."
+        )
+    if not security_store.permitir(
+        f"report-ip:{ip}",
+        settings.REPORT_RATE_LIMIT_PER_MINUTE * 3,
+        60,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Demasiadas consultas de reportes. Espere un minuto."
+        )
+    if not _REPORT_SEMAFORO.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="El servidor está procesando demasiados reportes. Reintente en unos segundos."
+        )
+    try:
+        yield
+    finally:
+        _REPORT_SEMAFORO.release()
+
+
+class _ReporteRoute(APIRoute):
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request):
+            response = await original(request)
+            usuario = getattr(request.state, "usuario", None)
+            if usuario is None or _visualiza_totales(usuario):
+                return response
+            if not isinstance(response, JSONResponse):
+                return response
+            try:
+                contenido = json.loads(response.body)
+            except (TypeError, ValueError):
+                return response
+            contenido = _ocultar_totales(contenido)
+            headers = {
+                k: v for k, v in response.headers.items()
+                if k.lower() not in {"content-length", "content-type"}
+            }
+            return JSONResponse(
+                content=contenido,
+                status_code=response.status_code,
+                headers=headers,
+            )
+
+        return handler
+
 
 def _cache_get(key):
     with _report_lock:
@@ -35,7 +202,9 @@ def _cache_set(key, value):
 
 router = APIRouter(
     prefix="/reportes",
-    tags=["Reportes"]
+    tags=["Reportes"],
+    route_class=_ReporteRoute,
+    dependencies=[Depends(_limite_reportes)],
 )
 
 
@@ -57,7 +226,7 @@ def _get_empresa_id(usuario):
     return _clean_int(usuario.empresa_id)
 
 
-def _ejecutar_consultas(consultas, params, max_workers=4):
+def _ejecutar_consultas(consultas, params, max_workers=8):
     def _ejecutar_una(nombre, sql, modo):
         with SessionLocal() as s:
             try:
@@ -85,7 +254,7 @@ def _ejecutar_consultas(consultas, params, max_workers=4):
 
 @router.get("/sucursales")
 def listar_sucursales(
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -95,8 +264,8 @@ def listar_sucursales(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_compras = _tabla("comprobantes_compras", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
 
     q = text(f"""
         SELECT ids.id_sucursal AS id, SUM(ids.cantidad) AS comprobantes
@@ -129,7 +298,7 @@ def listar_sucursales(
 def dashboard(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user)
 ):
     eid = _get_empresa_id(usuario)
@@ -138,9 +307,9 @@ def dashboard(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
-    t_ingresos = "ingresos_egresos" if estado == 0 else "_ingresos_egresos"
+    t_compras = _tabla("comprobantes_compras", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
+    t_ingresos = _tabla("ingresos_egresos", estado)
 
     wf_int = ""
     wf_dt  = ""
@@ -389,7 +558,7 @@ def dashboard(
 def compras_iva(
     anio: Optional[int] = Query(None),
     mes: Optional[int] = Query(None),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -399,8 +568,8 @@ def compras_iva(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_compras = _tabla("comprobantes_compras", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
 
     where_extra = ""
     if anio:
@@ -472,7 +641,7 @@ def compras_acumuladas(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -482,7 +651,7 @@ def compras_acumuladas(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
+    t_compras = _tabla("comprobantes_compras", estado)
     where = "WHERE c.id_empresa = :eid"
 
     if sucursal:
@@ -620,7 +789,7 @@ def compras_provincias(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -630,7 +799,7 @@ def compras_provincias(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
+    t_compras = _tabla("comprobantes_compras", estado)
     where = "WHERE c.id_empresa = :eid"
 
     if sucursal:
@@ -760,7 +929,7 @@ def compras_proveedores(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -771,8 +940,8 @@ def compras_proveedores(
         return cached
 
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
-    t_esporadicos = "esporadicos" if estado == 0 else "_esporadicos"
+    t_compras = _tabla("comprobantes_compras", estado)
+    t_esporadicos = _tabla("esporadicos", estado)
     where = "WHERE c.id_empresa = :eid"
 
     if sucursal:
@@ -897,7 +1066,7 @@ def compras_insumos(
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
     mrad: int = Query(3, description="1=periodo, 2=fecha, 3=fecha detalle, 4=registracion"),
     segundo: int = Query(2, description="1=agrupado, 2=desagregado"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -907,8 +1076,8 @@ def compras_insumos(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_cuerpo = "comprobantes_cuerpo" if estado == 0 else "_comprobantes_cuerpo"
-    t_esporadicos = "esporadicos" if estado == 0 else "_esporadicos"
+    t_cuerpo = _tabla("comprobantes_cuerpo", estado)
+    t_esporadicos = _tabla("esporadicos", estado)
     ins_q = ""
     if insumo:
         params["insumo"] = f"%{insumo}%"
@@ -1042,7 +1211,7 @@ def ventas_acumuladas(
     hasta: Optional[str] = Query(None),
     mrad: int = Query(1, description="1=periodo (mes/ano), 2=fecha"),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1052,7 +1221,7 @@ def ventas_acumuladas(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_ventas = _tabla("comprobantes_ventas", estado)
     where_extra = ""
     if sucursal:
         sucursal_ids = [s.strip() for s in sucursal.split(",") if s.strip()]
@@ -1120,7 +1289,7 @@ def ventas_totales(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1130,7 +1299,7 @@ def ventas_totales(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_ventas = _tabla("comprobantes_ventas", estado)
     where_extra = ""
     if sucursal:
         sucursal_ids = [s.strip() for s in sucursal.split(",") if s.strip()]
@@ -1218,7 +1387,7 @@ def ventas_provincias(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1228,7 +1397,7 @@ def ventas_provincias(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_ventas = _tabla("comprobantes_ventas", estado)
     where = "WHERE c.id_empresa = :eid"
 
     if sucursal:
@@ -1358,7 +1527,7 @@ def ventas_vendedor(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1368,7 +1537,7 @@ def ventas_vendedor(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_ventas = _tabla("comprobantes_ventas", estado)
     where = "WHERE c.id_empresa = :eid"
 
     if sucursal:
@@ -1499,7 +1668,7 @@ def ventas_zonas(
     desde: Optional[str] = Query(None),
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1509,7 +1678,7 @@ def ventas_zonas(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_ventas = _tabla("comprobantes_ventas", estado)
     where = "WHERE c.id_empresa = :eid"
 
     if sucursal:
@@ -1641,7 +1810,7 @@ def ventas_clientes_totales(
     hasta: Optional[str] = Query(None),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
     cliente: Optional[str] = Query(None, description="Filtro por nombre de cliente"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1651,8 +1820,8 @@ def ventas_clientes_totales(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
-    t_esporadicos = "esporadicos" if estado == 0 else "_esporadicos"
+    t_ventas = _tabla("comprobantes_ventas", estado)
+    t_esporadicos = _tabla("esporadicos", estado)
     where = "WHERE c.id_empresa = :eid"
 
     if sucursal:
@@ -1766,7 +1935,7 @@ def ventas_insumos(
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
     rubro: Optional[str] = Query(None, description="Filtro por nombre de rubro"),
     segundo: int = Query(1, description="1=agrupado por articulo, 2=agrupado por cliente+articulo"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1776,9 +1945,9 @@ def ventas_insumos(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_cuerpo = "comprobantes_cuerpo" if estado == 0 else "_comprobantes_cuerpo"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
-    t_esporadicos = "esporadicos" if estado == 0 else "_esporadicos"
+    t_cuerpo = _tabla("comprobantes_cuerpo", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
+    t_esporadicos = _tabla("esporadicos", estado)
     where = "WHERE c.id_empresa=:eid and c.identificacion like binary 'V'"
 
     if sucursal:
@@ -1887,7 +2056,7 @@ def ventas_insumos(
 
 @router.get("/herramientas/comparativos")
 def herramientas_comparativos(
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1897,8 +2066,8 @@ def herramientas_comparativos(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_compras = _tabla("comprobantes_compras", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
 
     q = text(f"""
         SELECT
@@ -2019,7 +2188,7 @@ def herramientas_facturacion(
     hasta: Optional[str] = Query(None),
     tipo_comprobante: Optional[str] = Query(None),
     cliente: Optional[str] = Query(None),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2029,7 +2198,7 @@ def herramientas_facturacion(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_ventas = _tabla("comprobantes_ventas", estado)
     where = "WHERE v.id_empresa = :eid AND v.anulado = 0"
 
     if desde:
@@ -2071,7 +2240,6 @@ def herramientas_facturacion(
         LEFT JOIN tipos_comprobantes t ON t.id = v.id_comprobante
         {where}
         ORDER BY v.fecha DESC
-        LIMIT 500
     """)
 
     try:
@@ -2085,7 +2253,7 @@ def herramientas_facturacion(
 
 @router.get("/herramientas/indicadores")
 def herramientas_indicadores(
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2095,8 +2263,8 @@ def herramientas_indicadores(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_compras = "comprobantes_compras" if estado == 0 else "_comprobantes_compras"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_compras = _tabla("comprobantes_compras", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
 
     q_ventas = text(f"SELECT COALESCE(SUM(IF(t.tipo = '+', v.total_comprobante, -v.total_comprobante)), 0) FROM {t_ventas} v LEFT JOIN tipos_comprobantes t ON t.id = v.id_comprobante WHERE v.id_empresa = :eid AND v.anulado = 0")
     q_compras = text(f"SELECT COALESCE(SUM(total_comprobante), 0) FROM {t_compras} WHERE id_empresa = :eid")
@@ -2126,7 +2294,7 @@ def insumos_compras_ventas(
     segundo: int = Query(2, description="1=agrupado, 2=desagregado"),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
     rubro: Optional[str] = Query(None, description="Filtro por nombre de rubro"),
-    estado: int = Query(0, description="0=usa precio_ultima_compra, >0=usa precio_ultima_compra_"),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2136,8 +2304,8 @@ def insumos_compras_ventas(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_cuerpo = "comprobantes_cuerpo" if estado == 0 else "_comprobantes_cuerpo"
-    t_esporadicos = "esporadicos" if estado == 0 else "_esporadicos"
+    t_cuerpo = _tabla("comprobantes_cuerpo", estado)
+    t_esporadicos = _tabla("esporadicos", estado)
 
     where = "WHERE c.id_empresa=:eid"
     if sucursal:
@@ -2156,7 +2324,7 @@ def insumos_compras_ventas(
     def av(expr):
         return f"MAX({expr})" if agrupado else expr
 
-    precio_arti = "a.precio_ultima_compra" if estado == 0 else "a.precio_ultima_compra_"
+    precio_arti = _columna("precio_ultima_compra", estado)
     caso_fecha = "c.fecha_movimiento" if mrad != 4 else "DATE(c.registracion)"
 
     fechaf = ""
@@ -2243,7 +2411,7 @@ def ventas_insumos_comprobante(
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
     cliente: Optional[str] = Query(None, description="Filtro por nombre de cliente"),
     deprueba: bool = Query(False, description="True=reemplaza nombre de cliente por 'Cliente DEMO'"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2253,7 +2421,7 @@ def ventas_insumos_comprobante(
     if cached is not None:
         return cached
     params = {"eid": eid, "deprueba": 1 if deprueba else 0}
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_ventas = _tabla("comprobantes_ventas", estado)
 
     where = "WHERE c.id_empresa=:eid and c.anulado=0"
     if sucursal:
@@ -2327,7 +2495,7 @@ def gastos_detalle(
     hasta: Optional[str] = Query(None),
     mrad: int = Query(1, description="1=periodo, 2=entre fechas, 3=detalle por movimiento, 4=registracion"),
     sucursal: Optional[str] = Query(None, description="IDs de sucursal separados por coma"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2337,8 +2505,8 @@ def gastos_detalle(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_cuerpo = "comprobantes_cuerpo" if estado == 0 else "_comprobantes_cuerpo"
-    t_ingresos = "ingresos_egresos" if estado == 0 else "_ingresos_egresos"
+    t_cuerpo = _tabla("comprobantes_cuerpo", estado)
+    t_ingresos = _tabla("ingresos_egresos", estado)
 
     def _add_sucursal(prefix):
         cond = ""
@@ -2467,7 +2635,7 @@ def ventas_vendedores(
     hasta: Optional[str] = Query(None),
     mrad: int = Query(1, description="1=periodo, 2=agrupado por fecha, 3=detalle por fecha, 4=detalle por registracion"),
     rubro: Optional[str] = Query(None, description="Si se provee, desagrega por rubro del articulo"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2477,8 +2645,8 @@ def ventas_vendedores(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_cuerpo = "comprobantes_cuerpo" if estado == 0 else "_comprobantes_cuerpo"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_cuerpo = _tabla("comprobantes_cuerpo", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
 
     def _fechaf_periodo(alias):
         ff = ""
@@ -2632,7 +2800,7 @@ def ventas_vendedores_rubros(
     mrad: int = Query(1, description="1=periodo, 2=entre fechas, 3=detalle, 4=registracion"),
     segundo: int = Query(1, description="1=agrupado por articulo, 2=desagregado"),
     vendedor: Optional[str] = Query(None, description="Filtro por nombre de vendedor"),
-    estado: int = Query(0),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2642,8 +2810,8 @@ def ventas_vendedores_rubros(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_cuerpo = "comprobantes_cuerpo" if estado == 0 else "_comprobantes_cuerpo"
-    t_ventas = "comprobantes_ventas" if estado == 0 else "_comprobantes_ventas"
+    t_cuerpo = _tabla("comprobantes_cuerpo", estado)
+    t_ventas = _tabla("comprobantes_ventas", estado)
     where = "WHERE v.id_empresa=:eid and v.anulado=0 and c.id_empresa=:eid"
 
     if vendedor:
@@ -2757,7 +2925,7 @@ def resultados_ventas(
     hasta: Optional[str] = Query(None),
     mrad: int = Query(1, description="1=periodo, 2=entre fechas, 3=detalle, 4=registracion"),
     segundo: int = Query(1, description="1=agrupado Venta-Costo, 2=desagregado Venta-Costo, 3=agrupado Venta-P.UltimaCompra, 4=desagregado Venta-P.UltimaCompra"),
-    estado: int = Query(0, description="0=usa precio_ultima_compra, >0=usa precio_ultima_compra_"),
+    estado: int = Depends(_estado_param),
     usuario: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2767,14 +2935,14 @@ def resultados_ventas(
     if cached is not None:
         return cached
     params = {"eid": eid}
-    t_cuerpo = "comprobantes_cuerpo" if estado == 0 else "_comprobantes_cuerpo"
+    t_cuerpo = _tabla("comprobantes_cuerpo", estado)
     where = "WHERE c.id_empresa=:eid and c.identificacion='V'"
 
     agrupado = (segundo == 1 or segundo == 3)
     if segundo == 1 or segundo == 2:
         c_campo_precio = "a.precio_costo"
     else:
-        c_campo_precio = "a.precio_ultima_compra" if estado == 0 else "a.precio_ultima_compra_"
+        c_campo_precio = _columna("precio_ultima_compra", estado)
 
     def av(expr):
         return f"MAX({expr})" if agrupado else expr

@@ -1,8 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from ..auth import get_current_user, verificar_password, hashear_password, invalidar_tokens_usuario
-from .. import schemas
+from ..auth import (
+    clear_session_cookie,
+    get_current_user,
+    hashear_password,
+    invalidar_tokens_usuario,
+    verificar_password,
+)
+from .. import schemas, security_store
 from ..database import get_db
 
 router = APIRouter(
@@ -29,35 +35,38 @@ def perfil(
 @router.put("/password")
 def cambiar_password(
     datos: schemas.CambiarPasswordRequest,
+    response: Response,
     usuario=Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    password_valida = verificar_password(usuario, datos.password_actual)
-
-    if not password_valida:
+    if not security_store.permitir(
+        f"password-change:{usuario.id}", 5, 5 * 60
+    ):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Demasiados intentos. Intente nuevamente más tarde."
+        )
+
+    if not verificar_password(usuario, datos.password_actual):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="La contraseña actual no coincide"
         )
 
-    if len(datos.password_nueva) < 6:
+    try:
+        usuario.password = hashear_password(datos.password_nueva)
+    except ValueError as exc:
         raise HTTPException(
-            status_code=400,
-            detail="La nueva contraseña debe tener al menos 6 caracteres"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc)
         )
 
-    if verificar_password(usuario, datos.password_nueva):
-        raise HTTPException(
-            status_code=400,
-            detail="La nueva contraseña debe ser distinta a la actual"
-        )
-
-    usuario.password = hashear_password(datos.password_nueva)
     db.commit()
     invalidar_tokens_usuario(usuario.id)
+    clear_session_cookie(response)
 
     return {
-        "mensaje": "Contraseña actualizada"
+        "mensaje": "Contraseña actualizada. Inicie sesión nuevamente."
     }
 
 

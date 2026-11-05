@@ -73,13 +73,15 @@
 </template>
 
 <script setup>
-import { ref, shallowRef, computed, onMounted } from 'vue'
+import { ref, shallowRef, computed, onMounted, watch } from 'vue'
 import api from '../../api'
 import { exportToExcel } from '../../utils/exportToExcel'
 import ChartCard from '../../components/ui/ChartCard.vue'
 import BaseChart from '../../components/charts/BaseChart.vue'
 import { colorVentas, colorCompras } from '../../utils/chartTokens'
+import { useEstadoDatos } from '../../composables/useEstadoDatos'
 
+const { estado } = useEstadoDatos()
 const comparativos = shallowRef([])
 const cargando = ref(false)
 const error = ref('')
@@ -103,7 +105,9 @@ const cargar = async () => {
   cargando.value = true
   error.value = ''
   try {
-    const { data } = await api.get('/reportes/herramientas/comparativos')
+    const { data } = await api.get('/reportes/herramientas/comparativos', {
+      params: { estado: estado.value }
+    })
     comparativos.value = Array.isArray(data) ? data : data.data || []
   } catch (e) {
     error.value = e.response?.data?.detail || 'No se pudieron cargar los datos.'
@@ -120,5 +124,6 @@ const exportar = () => {
   ], 'Comparativos')
 }
 
+watch(estado, cargar)
 onMounted(cargar)
 </script>

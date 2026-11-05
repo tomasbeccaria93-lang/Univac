@@ -1,11 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.security import HTTPAuthorizationCredentials
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session, joinedload
-import jwt
 import logging
-from datetime import datetime, timedelta, timezone
+import secrets
 import time
 
+from .. import security_store
 from ..database import get_db
 from ..models import Usuario
 from ..schemas import (
@@ -13,7 +12,17 @@ from ..schemas import (
     SeleccionarEmpresaRequest, MultiEmpresaResponse,
     EmpresaOpcion
 )
-from ..auth import get_current_user, invalidar_token, verificar_password, security
+from ..auth import (
+    clear_session_cookie,
+    decodificar_token,
+    firmar_token,
+    get_current_user,
+    invalidar_token,
+    set_session_cookie,
+    token_de_request,
+    verificar_password,
+    verificar_password_dummy,
+)
 from ..config import settings
 
 logger = logging.getLogger("univac.auth")
@@ -23,16 +32,14 @@ router = APIRouter(
     tags=["Autenticacion"]
 )
 
-SECRET_KEY = settings.SECRET_KEY
-ALGORITHM = settings.ALGORITHM
 ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
 
 _SELECCION_TIMEOUT_SEG = 5 * 60
-_selecciones_pendientes = {}
+_SELECCION_MAX_INTENTOS = 5
 
 _RATE_LIMIT_WINDOW = 60
 _RATE_LIMIT_MAX = 10
-_login_attempts = {}
+_RATE_LIMIT_MAX_IP = 30
 
 
 def _to_bool(v):
@@ -60,67 +67,47 @@ def _to_str(v):
     return str(v).strip()
 
 
-def crear_token(usuario):
-    import uuid
-    datos = {
-        "id": usuario.id,
-        "empresa": usuario.empresa_id,
-        "usuario": usuario.usuario,
-        "jti": str(uuid.uuid4()),
-        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    }
-    return jwt.encode(datos, SECRET_KEY, algorithm=ALGORITHM)
+def _demasiados_intentos():
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="Demasiados intentos. Intente nuevamente en un minuto."
+    )
 
 
-def _registrar_seleccion_pendiente(usuario_id):
-    now = datetime.now(timezone.utc).timestamp()
-    expirados = [k for k, v in _selecciones_pendientes.items() if now > v]
-    for k in expirados:
-        _selecciones_pendientes.pop(k, None)
-    _selecciones_pendientes[usuario_id] = (
-        datetime.now(timezone.utc) + timedelta(seconds=_SELECCION_TIMEOUT_SEG)
-    ).timestamp()
+def _credenciales_invalidas():
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Usuario o contraseña incorrectos"
+    )
 
 
-def _validar_seleccion_pendiente(usuario_id):
-    vencimiento = _selecciones_pendientes.get(usuario_id)
-    if vencimiento is None:
-        return False
-    if datetime.now(timezone.utc).timestamp() > vencimiento:
-        _selecciones_pendientes.pop(usuario_id, None)
-        return False
-    return True
+def _crear_codigo_seleccion(pares):
+    code = secrets.token_urlsafe(48)
+    payload = [[int(uid), int(eid)] for uid, eid in pares]
+    security_store.crear_codigo_seleccion(
+        code,
+        payload,
+        expires_at=time.time() + _SELECCION_TIMEOUT_SEG,
+        attempts=_SELECCION_MAX_INTENTOS,
+    )
+    return code
 
 
-def _check_rate_limit(key):
-    now = time.time()
-    attempts = _login_attempts.get(key, [])
-    attempts = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
-    if len(attempts) >= _RATE_LIMIT_MAX:
-        _login_attempts[key] = attempts
-        return False
-    attempts.append(now)
-    _login_attempts[key] = attempts
-    if len(_login_attempts) > 1000:
-        stale_keys = [
-            k for k, v in _login_attempts.items()
-            if not v or v[-1] < now - _RATE_LIMIT_WINDOW
-        ]
-        for k in stale_keys:
-            _login_attempts.pop(k, None)
-    return True
-
-
-def _construir_respuesta_login(usuario):
+def _construir_respuesta_login(usuario, response: Response):
     empresa_nombre = ""
     empresa_activa = True
     if usuario.empresa:
         empresa_nombre = _to_str(usuario.empresa.nombre)
         empresa_activa = not _to_bool(usuario.empresa.bloqueado)
 
+    token, payload = firmar_token(usuario)
+    set_session_cookie(response, token)
+
     return LoginResponse(
-        access_token=crear_token(usuario),
-        token_type="bearer",
+        access_token="",
+        token_type="cookie",
+        csrf_token=payload["csrf"],
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         usuario_id=usuario.id,
         empresa_id=usuario.empresa_id,
         nombre=usuario.nombre,
@@ -139,18 +126,24 @@ def _construir_respuesta_login(usuario):
 @router.post("/login", response_model=None)
 def login(
     request: Request,
+    response: Response,
     datos: LoginRequest,
     db: Session = Depends(get_db)
 ):
-    # La clave combina IP y usuario: con solo el usuario se podrian enumerar
-    # cuentas variando el documento, porque cada par creaba su propio bucket.
     ip = request.client.host if request.client else "desconocida"
-    rate_key = f"{ip}:{datos.usuario}"
-    if not _check_rate_limit(rate_key):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Demasiados intentos. Intente nuevamente en un minuto."
-        )
+
+    # El limite por IP frena la enumeracion masiva de documentos; el limite
+    # por IP+usuario protege una cuenta concreta.
+    if not security_store.permitir(
+        f"login-ip:{ip}", _RATE_LIMIT_MAX_IP, _RATE_LIMIT_WINDOW
+    ):
+        _demasiados_intentos()
+    if not security_store.permitir(
+        f"login-user:{ip}:{datos.usuario.strip().lower()}",
+        _RATE_LIMIT_MAX,
+        _RATE_LIMIT_WINDOW,
+    ):
+        _demasiados_intentos()
 
     usuarios = db.query(Usuario).options(
         joinedload(Usuario.empresa)
@@ -160,10 +153,8 @@ def login(
     ).all()
 
     if not usuarios:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario o contraseña incorrectos"
-        )
+        verificar_password_dummy()
+        _credenciales_invalidas()
 
     validos = []
     for u in usuarios:
@@ -173,45 +164,30 @@ def login(
             validos.append(u)
 
     if not validos:
-        if all(u.bloqueado for u in usuarios):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="El usuario se encuentra deshabilitado"
-            )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario o contraseña incorrectos"
-        )
+        verificar_password_dummy()
+        _credenciales_invalidas()
 
     autorizados = [u for u in validos if _to_int(u.nivel_clave) == 2]
-
     if not autorizados:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Usuario no autorizado"
-        )
+        logger.info("login: credenciales válidas sin nivel_clave=2")
+        _credenciales_invalidas()
 
     candidatos = [u for u in autorizados if u.empresa is not None]
-
     if not candidatos:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="El usuario no tiene una empresa cargada. Contacte al administrador del sistema."
-        )
+        logger.info("login: credenciales válidas sin empresa asociada")
+        _credenciales_invalidas()
 
     candidatos = [u for u in candidatos if not _to_bool(u.empresa.bloqueado)]
-
     if not candidatos:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Todas las empresas asociadas a su usuario se encuentran inactivas. Comuniquese con el administrador del sistema."
-        )
+        logger.info("login: credenciales válidas con todas las empresas inactivas")
+        _credenciales_invalidas()
 
     if len(candidatos) == 1:
-        return _construir_respuesta_login(candidatos[0])
+        return _construir_respuesta_login(candidatos[0], response)
 
-    for u in candidatos:
-        _registrar_seleccion_pendiente(u.id)
+    selection_token = _crear_codigo_seleccion(
+        [(u.id, u.empresa_id) for u in candidatos]
+    )
 
     empresas_opciones = []
     for u in candidatos:
@@ -220,7 +196,7 @@ def login(
             EmpresaOpcion(
                 id=u.empresa_id,
                 nombre=_to_str(emp.nombre),
-                cuit=_to_str(emp.cuit),
+                cuit=_to_str(emp.cuit) if _to_bool(u.visualiza_totales) else "",
                 activa=not _to_bool(emp.bloqueado),
                 usuario_id=u.id
             )
@@ -228,19 +204,31 @@ def login(
 
     return MultiEmpresaResponse(
         usuario_nombre=_to_str(candidatos[0].usuario),
+        selection_token=selection_token,
+        expires_in=_SELECCION_TIMEOUT_SEG,
         empresas=empresas_opciones
     )
 
 
 @router.post("/seleccionar-empresa", response_model=LoginResponse)
 def seleccionar_empresa(
+    response: Response,
     datos: SeleccionarEmpresaRequest,
     db: Session = Depends(get_db)
 ):
-    if not _validar_seleccion_pendiente(datos.usuario_id):
+    pares = security_store.usar_codigo_seleccion(datos.selection_token)
+    if not pares:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Debe iniciar sesion nuevamente para elegir la empresa"
+            detail="Debe iniciar sesión nuevamente para elegir la empresa"
+        )
+
+    autorizado = [int(uid) for uid, eid in pares
+                  if int(uid) == datos.usuario_id and int(eid) == datos.empresa_id]
+    if not autorizado:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Debe iniciar sesión nuevamente para elegir la empresa"
         )
 
     usuario = db.query(Usuario).options(
@@ -250,30 +238,29 @@ def seleccionar_empresa(
         Usuario.empresa_id == datos.empresa_id
     ).first()
 
-    if usuario is None:
+    if (
+        usuario is None
+        or usuario.bloqueado
+        or _to_int(usuario.nivel_clave) != 2
+    ):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No se encontro acceso a esa empresa"
-        )
-
-    if usuario.bloqueado:
-        raise HTTPException(
-            status_code=403,
-            detail="Usuario deshabilitado para esta empresa"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No se encontró acceso a esa empresa"
         )
 
     if usuario.empresa is None or _to_bool(usuario.empresa.bloqueado):
         raise HTTPException(
-            status_code=403,
-            detail="La empresa se encuentra inactiva. Comuniquese con el administrador del sistema."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="La empresa se encuentra inactiva. Comuníquese con el administrador del sistema."
         )
 
-    _selecciones_pendientes.pop(datos.usuario_id, None)
-    return _construir_respuesta_login(usuario)
+    security_store.borrar_codigo_seleccion(datos.selection_token)
+    return _construir_respuesta_login(usuario, response)
 
 
 @router.get("/me")
 def mi_cuenta(
+    request: Request,
     usuario: Usuario = Depends(get_current_user)
 ):
     empresa_nombre = ""
@@ -281,6 +268,8 @@ def mi_cuenta(
     if usuario.empresa:
         empresa_nombre = _to_str(usuario.empresa.nombre)
         empresa_activa = not _to_bool(usuario.empresa.bloqueado)
+
+    payload = getattr(request.state, "auth_payload", {}) or {}
 
     return {
         "id": usuario.id,
@@ -304,7 +293,8 @@ def mi_cuenta(
         "hora_desde": _to_str(usuario.hora_desde),
         "hora_hasta": _to_str(usuario.hora_hasta),
         "bloqueado": _to_bool(usuario.bloqueado),
-        "rol": _to_int(usuario.rol)
+        "rol": _to_int(usuario.rol),
+        "csrf_token": payload.get("csrf", ""),
     }
 
 
@@ -319,18 +309,20 @@ def verify(
 
 
 @router.post("/logout")
-def logout(
-    usuario: Usuario = Depends(get_current_user),
-    credentials: HTTPAuthorizationCredentials | None = Depends(security)
-):
-    if credentials:
-        try:
-            payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-            jti = payload.get("jti")
-            if jti:
-                invalidar_token(jti)
-        except Exception as exc:
-            logger.warning("logout: no se pudo invalidar el token: %s", exc)
-    return {
-        "success": True
-    }
+def logout(request: Request, response: Response):
+    token, via_cookie = token_de_request(request)
+    if token and via_cookie:
+        payload = decodificar_token(token, verificar_exp=False)
+        if payload and payload.get("purpose") == "access":
+            csrf_header = request.headers.get("X-CSRF-Token", "")
+            csrf_claim = payload.get("csrf", "")
+            if not csrf_header or not csrf_claim or not secrets.compare_digest(
+                csrf_header, csrf_claim
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="CSRF token inválido"
+                )
+            invalidar_token(payload.get("jti"), payload.get("exp"))
+    clear_session_cookie(response)
+    return {"success": True}

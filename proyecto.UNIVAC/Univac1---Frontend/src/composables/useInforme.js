@@ -105,14 +105,15 @@ export function useInforme(config, opciones = {}) {
 
   function ajustarFechasAlTipo() {
     const esMes = mrad.value === 1
-    desde.value = recortar(esMes ? desde.value.slice(0, 7) : desde.value, esMes)
-    hasta.value = recortar(esMes ? hasta.value.slice(0, 7) : hasta.value, esMes)
+    desde.value = recortar(desde.value, esMes)
+    hasta.value = recortar(hasta.value, esMes)
   }
 
   function recortar(v, esMes) {
     if (!v) return ''
-    if (esMes) return /^\d{4}-\d{2}$/.test(v) ? v : v.slice(0, 7)
-    return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : v.slice(0, 10)
+    if (esMes) return v.slice(0, 7)
+    const conDia = /^\d{4}-\d{2}$/.test(v) ? `${v}-01` : v
+    return conDia.slice(0, 10)
   }
 
   function limpiarResultados() {

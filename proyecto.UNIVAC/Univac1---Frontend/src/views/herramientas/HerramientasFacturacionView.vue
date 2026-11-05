@@ -93,13 +93,15 @@
 </template>
 
 <script setup>
-import { ref, shallowRef, computed, onMounted } from 'vue'
+import { ref, shallowRef, computed, onMounted, watch } from 'vue'
 import api from '../../api'
 import { exportToExcel } from '../../utils/exportToExcel'
 import ChartCard from '../../components/ui/ChartCard.vue'
 import BaseChart from '../../components/charts/BaseChart.vue'
 import { colorVentas, colorAcumulado } from '../../utils/chartTokens'
+import { useEstadoDatos } from '../../composables/useEstadoDatos'
 
+const { estado } = useEstadoDatos()
 const desde = ref('')
 const hasta = ref('')
 const tipo_comprobante = ref('')
@@ -135,7 +137,7 @@ const buscar = async () => {
   facturas.value = []
   try {
     const { data } = await api.get('/reportes/herramientas/facturacion', {
-      params: { desde: desde.value || undefined, hasta: hasta.value || undefined, tipo_comprobante: tipo_comprobante.value || undefined, cliente: cliente.value || undefined }
+      params: { desde: desde.value || undefined, hasta: hasta.value || undefined, tipo_comprobante: tipo_comprobante.value || undefined, cliente: cliente.value || undefined, estado: estado.value }
     })
     facturas.value = Array.isArray(data) ? data : data.data || []
   } catch (e) {
@@ -156,5 +158,6 @@ const exportar = () => {
   ], 'Facturacion')
 }
 
+watch(estado, buscar)
 onMounted(buscar)
 </script>

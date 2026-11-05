@@ -4,9 +4,8 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 import os
 
-load_dotenv()
-
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BACKEND_DIR / ".env")
 
 
 def _requerido(nombre: str, valor: str | None) -> str:
@@ -58,10 +57,26 @@ class Settings:
         defecto=bool(DB_SSL_CA),
     )
 
-    ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+    # En produccion el valor por defecto es el seguro: si un deploy olvida
+    # definir ENVIRONMENT, no se publican /docs ni /redoc.
+    ENVIRONMENT = os.getenv("ENVIRONMENT", "production").strip().lower()
+    if ENVIRONMENT not in {"development", "production"}:
+        raise RuntimeError(
+            "ENVIRONMENT debe ser 'development' o 'production'."
+        )
 
     # --- Seguridad ---------------------------------------------------------
     SECRET_KEY = _requerido("SECRET_KEY", os.getenv("SECRET_KEY"))
+    if len(SECRET_KEY) < 32 or SECRET_KEY in {
+        "change-this-to-a-random-64-char-hex-string",
+        "changeme",
+        "secret",
+    }:
+        raise RuntimeError(
+            "SECRET_KEY es demasiado corta o usa un valor de ejemplo. "
+            "Genere una clave con: python -c \"import secrets; "
+            "print(secrets.token_hex(32))\"."
+        )
     ALGORITHM = "HS256"
 
     try:
@@ -72,15 +87,88 @@ class Settings:
         raise RuntimeError(
             "ACCESS_TOKEN_EXPIRE_MINUTES debe ser un numero entero."
         )
+    if ACCESS_TOKEN_EXPIRE_MINUTES < 1 or ACCESS_TOKEN_EXPIRE_MINUTES > 24 * 60:
+        raise RuntimeError(
+            "ACCESS_TOKEN_EXPIRE_MINUTES debe estar entre 1 y 1440."
+        )
+
+    # --- Cookies / CSRF ----------------------------------------------------
+    COOKIE_NAME = os.getenv("COOKIE_NAME", "univac_session").strip() or "univac_session"
+    _samesite = os.getenv("COOKIE_SAMESITE", "lax").strip().lower()
+    if _samesite not in {"lax", "strict", "none"}:
+        raise RuntimeError("COOKIE_SAMESITE debe ser lax, strict o none.")
+    COOKIE_SAMESITE = _samesite
+    COOKIE_SECURE = _booleano(
+        "COOKIE_SECURE",
+        os.getenv("COOKIE_SECURE"),
+        defecto=(ENVIRONMENT == "production"),
+    )
+    if COOKIE_SAMESITE == "none" and not COOKIE_SECURE:
+        raise RuntimeError(
+            "COOKIE_SAMESITE=none exige COOKIE_SECURE=true."
+        )
+    if ENVIRONMENT == "production" and not COOKIE_SECURE:
+        raise RuntimeError(
+            "En producción COOKIE_SECURE debe ser true (la sesión viaja por HTTPS)."
+        )
+    COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", "").strip() or None
+
+    EXPOSE_OPENAPI = _booleano(
+        "EXPOSE_OPENAPI",
+        os.getenv("EXPOSE_OPENAPI"),
+        defecto=(ENVIRONMENT == "development"),
+    )
+    if ENVIRONMENT == "production" and EXPOSE_OPENAPI:
+        raise RuntimeError(
+            "EXPOSE_OPENAPI debe ser false en producción "
+            "(/docs, /redoc y /openapi.json no se publican)."
+        )
+
+    # --- Store de seguridad (revocaciones, rate limit, seleccion) ----------
+    _store_path = os.getenv("SECURITY_STORE_PATH", "").strip()
+    SECURITY_STORE_PATH = (
+        Path(_store_path) if _store_path else BACKEND_DIR / "security_store.sqlite3"
+    )
+    if not SECURITY_STORE_PATH.is_absolute():
+        SECURITY_STORE_PATH = BACKEND_DIR / SECURITY_STORE_PATH
+
+    # --- Limites de reportes ----------------------------------------------
+    try:
+        REPORT_RATE_LIMIT_PER_MINUTE = int(
+            os.getenv("REPORT_RATE_LIMIT_PER_MINUTE", "30").strip() or "30"
+        )
+        REPORT_MAX_CONCURRENT = int(
+            os.getenv("REPORT_MAX_CONCURRENT", "3").strip() or "3"
+        )
+    except ValueError:
+        raise RuntimeError(
+            "REPORT_RATE_LIMIT_PER_MINUTE y REPORT_MAX_CONCURRENT deben ser enteros."
+        )
+    if REPORT_RATE_LIMIT_PER_MINUTE < 1 or REPORT_MAX_CONCURRENT < 1:
+        raise RuntimeError(
+            "Los limites de reportes deben ser mayores que cero."
+        )
 
     # --- CORS --------------------------------------------------------------
     _cors_env = os.getenv("CORS_ORIGINS", "http://localhost:5173")
-    if _cors_env.strip() == "*":
+    if any(o.strip() == "*" for o in _cors_env.split(",")):
         raise RuntimeError(
             "CORS_ORIGINS no puede ser '*'. "
             "Defina una lista explícita de orígenes permitidos (separados por coma)."
         )
-    CORS_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    CORS_ORIGINS = [o.strip().rstrip("/") for o in _cors_env.split(",") if o.strip()]
+    if not CORS_ORIGINS:
+        raise RuntimeError("CORS_ORIGINS no puede quedar vacío.")
+    if ENVIRONMENT == "production":
+        inseguros = [
+            o for o in CORS_ORIGINS
+            if "localhost" in o.lower() or "127.0.0.1" in o or "0.0.0.0" in o
+        ]
+        if inseguros:
+            raise RuntimeError(
+                "En producción CORS_ORIGINS no puede apuntar a localhost/127.0.0.1. "
+                "Configure el dominio real del frontend."
+            )
 
     def ssl_ca_path(self) -> str | None:
         """Ruta absoluta al certificado CA si SSL está habilitado."""
